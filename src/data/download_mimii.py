@@ -73,8 +73,8 @@ MIMII_PUMP_METADATA: Dict[str, Dict] = {
 }
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 (MIMII-Downloader/1.0)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 # Biến toàn cục phục vụ xử lý tín hiệu ngắt (Signal handler)
@@ -211,14 +211,58 @@ def is_snr_already_extracted(output_dir: str, snr_key: str) -> Tuple[bool, int, 
     return False, 0, ""
 
 
+def download_with_curl(
+    url: str,
+    temp_file: str,
+    token: Optional[str] = None,
+    logger=None,
+) -> bool:
+    """
+    Sử dụng lệnh curl của hệ thống Linux/Windows với tính năng Resume (-C -),
+    Redirect (-L) và đầy đủ browser headers để tránh lỗi 403 Forbidden từ Zenodo.
+    """
+    if not shutil.which("curl"):
+        return False
+
+    if logger:
+        logger.info(f"Đang gọi curl hệ thống (hỗ trợ HTTP/2, chống 403 & Resume)...")
+
+    cmd = [
+        "curl",
+        "-C", "-",
+        "-L",
+        "-A", DEFAULT_USER_AGENT,
+        "-H", "Referer: https://zenodo.org/records/3384388",
+        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "-H", "Accept-Language: en-US,en;q=0.9",
+        "--connect-timeout", "30",
+        "--retry", "5",
+        "--retry-delay", "5",
+        "-o", temp_file,
+    ]
+    if token:
+        cmd.extend(["-H", f"Authorization: Bearer {token}"])
+
+    cmd.append(url)
+
+    try:
+        proc = subprocess.run(cmd, check=False)
+        return proc.returncode == 0
+    except Exception as e:
+        if logger:
+            logger.warning(f"Lỗi khi thực thi curl: {e}")
+        return False
+
+
 def download_file_with_resume(
     url_list: List[str],
     destination_path: str,
     expected_size: Optional[int] = None,
     expected_md5: Optional[str] = None,
     chunk_size: int = 2 * 1024 * 1024,
-    timeout: int = 60,
+    timeout: int = 120,
     max_retries: int = 5,
+    token: Optional[str] = None,
     logger=None,
     checkpoint: Optional[DownloadCheckpoint] = None,
     snr_key: str = "",
@@ -276,7 +320,18 @@ def download_file_with_resume(
                         os.remove(temp_file)
                         existing_bytes = 0
 
-                headers = {"User-Agent": DEFAULT_USER_AGENT}
+                headers = {
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Referer": "https://zenodo.org/records/3384388",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"Windows"',
+                }
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+
                 if existing_bytes > 0:
                     headers["Range"] = f"bytes={existing_bytes}-"
                     pct = (existing_bytes / expected_size * 100) if expected_size else 0
@@ -313,7 +368,26 @@ def download_file_with_resume(
                     break
                 elif response.status_code in [403, 429]:
                     if logger:
-                        logger.warning(f"Zenodo trả về mã lỗi {response.status_code}. Thử nguồn khác...")
+                        logger.warning(
+                            f"Zenodo trả về mã lỗi {response.status_code} với requests. "
+                            f"Tự động kích hoạt cơ chế tải curl hệ thống..."
+                        )
+                    # Gọi curl hệ thống
+                    curl_success = download_with_curl(
+                        url=url,
+                        temp_file=temp_file,
+                        token=token,
+                        logger=logger,
+                    )
+                    if curl_success and os.path.exists(temp_file):
+                        if expected_size and os.path.getsize(temp_file) == expected_size:
+                            shutil.move(temp_file, destination_path)
+                            if expected_md5:
+                                actual_md5 = compute_md5(destination_path, logger=logger)
+                                if actual_md5.lower() == expected_md5.lower():
+                                    return True
+                            else:
+                                return True
                     break
                 else:
                     response.raise_for_status()
@@ -524,6 +598,7 @@ def download_mimii_pump(
     delete_zip: bool = False,
     skip_checksum: bool = False,
     force: bool = False,
+    token: Optional[str] = None,
     logger=None,
 ) -> bool:
     """
@@ -558,6 +633,8 @@ def download_mimii_pump(
     logger.info(f"   Tự động giải nén : {'BẬT' if extract else 'TẮT'}")
     logger.info(f"   Chế độ khôi phục : TỰ ĐỘNG RESUME (Chống mất dữ liệu khi bị kill)")
     logger.info(f"   Bắt buộc tải lại : {'BẬT' if force else 'TẮT'}")
+    if token:
+        logger.info(f"   Xác thực Zenodo  : Có sử dụng Access Token")
     logger.info("=" * 75)
 
     success_all = True
@@ -588,6 +665,7 @@ def download_mimii_pump(
             destination_path=dest_file,
             expected_size=meta["size_bytes"],
             expected_md5=expected_md5,
+            token=token,
             logger=logger,
             checkpoint=checkpoint,
             snr_key=snr_key,
@@ -663,6 +741,12 @@ def parse_args():
         help="Bắt buộc tải lại từ đầu, bỏ qua dữ liệu cũ.",
     )
     parser.add_argument(
+        "--token",
+        type=str,
+        default=os.environ.get("ZENODO_TOKEN", ""),
+        help="Personal Access Token của Zenodo (tùy chọn, giúp vượt qua giới hạn rate-limit)",
+    )
+    parser.add_argument(
         "--log_file",
         type=str,
         default="./logs/download_mimii.log",
@@ -681,6 +765,7 @@ def main():
         delete_zip=args.delete_zip,
         skip_checksum=args.skip_checksum,
         force=args.force,
+        token=args.token or None,
         logger=logger,
     )
 

@@ -139,6 +139,10 @@ tmux attach -t mimii_pump
 chmod +x scripts/run_download_server.sh
 ./scripts/run_download_server.sh
 
+# Hoặc cách 2.1B: Tải trực tiếp siêu tốc bằng curl native của Linux (chống 403 & tự động resume):
+chmod +x scripts/download_pump_curl.sh
+./scripts/download_pump_curl.sh
+
 # Hoặc cách 2.2: Chạy trực tiếp lệnh nohup
 nohup python -u src/data/download_mimii.py \
     --output_dir /hdd3/users/dunglt/edge_pump_asd/data \
