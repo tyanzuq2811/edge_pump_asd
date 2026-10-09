@@ -408,7 +408,7 @@ def download_mimii_pump(
 
         if extract:
             logger.info(f">>> [2/2] Bắt đầu giải nén {meta['filename']}...")
-            extract_dest = os.path.join(output_dir, "pump")
+            extract_dest = output_dir
             extract_ok = extract_zip_file(
                 zip_path=dest_file,
                 extract_to=extract_dest,
@@ -429,15 +429,33 @@ def download_mimii_pump(
     return success_all
 
 
+def get_default_data_dir() -> str:
+    """
+    Trả về đường dẫn lưu dữ liệu mặc định:
+    1. Ưu tiên biến môi trường PUMP_DATA_DIR nếu được thiết lập.
+    2. Nếu đang chạy trên Server (có thư mục /hdd3 hoặc /hdd3/users/dunglt),
+       mặc định là: /hdd3/users/dunglt/edge_pump_asd/data
+    3. Ngược lại (chạy ở local), mặc định là: ./data
+    """
+    env_dir = os.environ.get("PUMP_DATA_DIR")
+    if env_dir:
+        return env_dir
+    server_dir = "/hdd3/users/dunglt/edge_pump_asd/data"
+    if os.path.exists("/hdd3/users/dunglt") or os.path.exists("/hdd3"):
+        return server_dir
+    return "./data"
+
+
 def parse_args():
+    default_data_dir = get_default_data_dir()
     parser = argparse.ArgumentParser(
         description="Tải và quản lý tập dữ liệu âm thanh máy bơm (Pump) từ MIMII Dataset (Zenodo 3384388)."
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./Data/raw",
-        help="Đường dẫn thư mục lưu trữ dữ liệu tải về (Mặc định: ./Data/raw)",
+        default=default_data_dir,
+        help=f"Đường dẫn thư mục lưu trữ dữ liệu tải về (Mặc định: {default_data_dir})",
     )
     parser.add_argument(
         "--snr",

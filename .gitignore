@@ -47,6 +47,15 @@ nohup.out
 # Documentation & Proposal files (local only)
 /docs/
 
+# Data directories (MIMII dataset ~23GB, KHÔNG đưa lên Git!)
+/Data/
+/data/
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+
 # Audio & Feature caches
 *.wav
 *.mp3

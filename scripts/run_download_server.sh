@@ -25,8 +25,12 @@ else
     echo ">> Không tìm thấy venv cục bộ. Đang sử dụng Python mặc định của hệ thống: $(which python3 || which python)"
 fi
 
-# 2. Tạo thư mục chứa dữ liệu và log
-mkdir -p "$PROJECT_DIR/Data/raw"
+# 2. Xác định thư mục lưu dữ liệu
+# Ưu tiên tham số truyền vào $1, nếu không có sẽ mặc định là /hdd3/users/dunglt/edge_pump_asd/data
+DEFAULT_DATA_DIR="/hdd3/users/dunglt/edge_pump_asd/data"
+TARGET_DATA_DIR="${1:-$DEFAULT_DATA_DIR}"
+
+mkdir -p "$TARGET_DATA_DIR"
 mkdir -p "$PROJECT_DIR/logs"
 
 # 3. Cài đặt các thư viện cần thiết nếu chưa có
@@ -39,10 +43,11 @@ LOG_FILE="$PROJECT_DIR/logs/download_mimii.log"
 PYTHON_EXEC=$(which python3 || which python)
 
 echo ">> Đang khởi chạy tải dữ liệu ở chế độ nền (background) bằng nohup..."
+echo ">> Thư mục lưu dữ liệu: $TARGET_DATA_DIR"
 echo ">> File log ghi tại: $LOG_FILE"
 
 nohup "$PYTHON_EXEC" -u "$PROJECT_DIR/src/data/download_mimii.py" \
-    --output_dir "$PROJECT_DIR/Data/raw" \
+    --output_dir "$TARGET_DATA_DIR" \
     --snr all \
     --extract \
     --log_file "$LOG_FILE" > "$LOG_FILE" 2>&1 &

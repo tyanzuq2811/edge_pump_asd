@@ -112,8 +112,8 @@ tmux new -s mimii_pump
 # 2. Kích hoạt môi trường ảo (nếu chưa kích hoạt)
 source venv/bin/activate
 
-# 3. Chạy script tải và tự động giải nén
-python src/data/download_mimii.py --output_dir ./Data/raw --snr all --extract
+# 3. Chạy script tải và tự động giải nén (mặc định script sẽ tự nhận diện lưu vào /hdd3/users/dunglt/edge_pump_asd/data)
+python src/data/download_mimii.py --output_dir /hdd3/users/dunglt/edge_pump_asd/data --snr all --extract
 
 # 4. Rời khỏi tmux (Detach):
 #    Nhấn tổ hợp phím: Ctrl + B, sau đó nhấn phím D
@@ -130,13 +130,13 @@ tmux attach -t mimii_pump
 ### Cách 2: Sử dụng `nohup`
 
 ```bash
-# Cách 2.1: Dùng script tự động đã viết sẵn (cực kỳ tiện lợi)
+# Cách 2.1: Dùng script tự động đã cấu hình sẵn đường dẫn /hdd3/users/dunglt/edge_pump_asd/data
 chmod +x scripts/run_download_server.sh
 ./scripts/run_download_server.sh
 
 # Hoặc cách 2.2: Chạy trực tiếp lệnh nohup
 nohup python -u src/data/download_mimii.py \
-    --output_dir ./Data/raw \
+    --output_dir /hdd3/users/dunglt/edge_pump_asd/data \
     --snr all \
     --extract \
     --log_file ./logs/download_mimii.log > ./logs/download_mimii.log 2>&1 &
