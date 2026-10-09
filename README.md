@@ -160,26 +160,27 @@ kill <PID_của_tiến_trình>
 
 | Tham số | Giá trị mặc định | Giải thích |
 | :--- | :---: | :--- |
-| `--output_dir` | `./Data/raw` | Thư mục lưu file zip và dữ liệu |
+| `--output_dir` | `/hdd3/users/dunglt/edge_pump_asd/data` | Thư mục lưu file zip và dữ liệu (tự nhận diện server) |
 | `--snr` | `all` | Lựa chọn mức nhiễu: `all`, `-6_dB`, `0_dB`, `6_dB` |
 | `--extract` | `False` | Tự động giải nén sau khi tải xong |
 | `--delete_zip` | `False` | Tự động xóa file `.zip` sau khi giải nén xong để tiết kiệm ổ cứng |
 | `--skip_checksum` | `False` | Bỏ qua bước kiểm tra mã MD5 |
+| `--force` | `False` | Bắt buộc tải và giải nén lại từ đầu (bỏ qua checkpoint) |
 | `--log_file` | `./logs/download_mimii.log` | Đường dẫn file lưu nhật ký |
-
-**Ví dụ:**
-```bash
-# Chỉ tải tập 6_dB (nhiễu thấp nhất) để thử nghiệm trước và tự động giải nén:
-python src/data/download_mimii.py --snr 6_dB --extract
-
-# Tải tất cả các tập, giải nén và tự động xóa các file zip gốc để tiết kiệm 22GB ổ cứng:
-python src/data/download_mimii.py --snr all --extract --delete_zip
-```
 
 ---
 
-## 7. Các Tính Năng Kỹ Thuật Nổi Bật Của Bộ Tải
-1. **HTTP Range Resume**: Nếu mạng chập chờn hoặc rớt kết nối ở GB thứ 5, khi chạy lại script sẽ tự động tải tiếp từ 5 GB, không cần tải lại từ đầu.
-2. **MD5 Checksum Verification**: Xác thực tính toàn vẹn của từng file zip theo đúng mã băm chính thức từ Zenodo để đảm bảo không bị lỗi dữ liệu âm thanh.
-3. **Flush Buffer Real-time**: Luôn xả bộ nhớ đệm (buffer flush) để lệnh `tail -f` hiển thị tiến độ tức thì ngay cả khi chạy qua `nohup`.
-4. **Phát hiện TTY thông minh**: Tự động giảm tần suất in nhật ký khi chạy nền (non-interactive) để tránh tràn file log, nhưng vẫn hiển thị thanh tiến trình mượt mà khi chạy trong terminal tương tác (`tmux`).
+## 7. Cơ Chế Chịu Lỗi & Tự Động Tiếp Tục (Fault-Tolerance & Auto-Resume)
+
+Hệ thống được thiết kế đặc thù cho môi trường Server dùng chung (shared server), nơi tiến trình chạy nền có thể bị người khác hoặc hệ điều hành `kill` bất cứ lúc nào:
+
+1. **Bị kill khi đang tải file zip (ví dụ ở 4.5 GB / 7.3 GB)**:
+   - Dữ liệu được ghi trực tiếp xuống file tạm `.part` và ép đồng bộ ổ cứng vật lý (`os.fsync`) định kỳ.
+   - Khi chạy lại lệnh, script sẽ tự nhận diện đã có 4.5 GB trên đĩa, gửi request `Range: bytes=...` để **tải tiếp 2.8 GB còn lại**, hoàn toàn không tải lại từ byte 0!
+2. **Bị kill sau khi đã hoàn thành 1 hoặc 2 tập SNR**:
+   - Quản lý trạng thái bằng file checkpoint `.download_checkpoint.json` và kiểm tra cấu trúc thư mục thực tế (`id_00`, `id_02`, ...).
+   - Nếu tập `-6_dB` đã hoàn thành hoặc đã giải nén đủ file `.wav`, khi chạy lại script sẽ **bỏ qua ngay lập tức trong 0.1 giây** và chuyển thẳng sang tập tiếp theo.
+3. **Bị kill giữa chừng trong lúc đang giải nén**:
+   - Khi giải nén, script sẽ kiểm tra từng file `.wav` mục tiêu. Các file đã giải nén từ trước sẽ được bỏ qua, script chỉ giải nén tiếp các file còn thiếu.
+4. **Bắt tín hiệu `SIGTERM` / `SIGINT`**:
+   - Khi nhận tín hiệu dừng từ lệnh `kill <PID>`, script sẽ tự động xả hết bộ nhớ đệm (buffer flush), lưu trạng thái checkpoint an toàn trước khi dừng.

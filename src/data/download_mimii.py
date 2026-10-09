@@ -3,32 +3,32 @@ Script tải và giải nén dữ liệu máy bơm (Pump) từ bộ dữ liệu 
 Phục vụ đề tài NCKH: "Nghiên cứu và triển khai mô hình học sâu nhẹ phát hiện 
 âm thanh bất thường của máy bơm trên các nền tảng Edge AI".
 
-Zenodo Record: 3384388 (MIMII Dataset - Hitachi, Ltd.)
-Bao gồm 3 tập âm thanh máy bơm theo các mức tỉ số tín hiệu trên nhiễu (SNR):
-  1. -6_dB_pump.zip (~7.67 GB) - Mức nhiễu cao (-6 dB)
-  2.  0_dB_pump.zip (~7.33 GB) - Mức nhiễu trung bình (0 dB)
-  3.  6_dB_pump.zip (~7.13 GB) - Mức nhiễu thấp (6 dB)
+Hỗ trợ cơ chế chịu lỗi (Fault-Tolerant & Auto-Resume):
+  - Tiếp tục tải từ điểm bị ngắt nếu tiến trình bị kill (kill, pkill, kill -9).
+  - Tự động bỏ qua các tập SNR hoặc các file đã tải/giải nén hoàn thành.
+  - Cơ chế ghi trực tiếp xuống ổ cứng (fsync) định kỳ để không mất dữ liệu.
+  - Quản lý checkpoint trạng thái (.download_checkpoint.json).
 """
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
-import subprocess
+import signal
 import sys
 import time
 import zipfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import requests
 
-# Đảm bảo mã hóa UTF-8 trên Windows console
+# Đảm bảo mã hóa UTF-8 trên console
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
-
 
 # Thêm thư mục gốc vào sys.path để import modules nội bộ
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,6 +77,71 @@ DEFAULT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 (MIMII-Downloader/1.0)"
 )
 
+# Biến toàn cục phục vụ xử lý tín hiệu ngắt (Signal handler)
+CURRENT_FILE_HANDLE = None
+CURRENT_LOGGER = None
+
+
+def register_signal_handler():
+    """Bắt các tín hiệu ngắt tiến trình (SIGINT, SIGTERM) để flush dữ liệu an toàn trước khi dừng."""
+    def _handler(signum, frame):
+        global CURRENT_FILE_HANDLE, CURRENT_LOGGER
+        sig_name = "SIGTERM" if signum == signal.SIGTERM else ("SIGINT" if signum == signal.SIGINT else str(signum))
+        if CURRENT_FILE_HANDLE and not CURRENT_FILE_HANDLE.closed:
+            try:
+                CURRENT_FILE_HANDLE.flush()
+                os.fsync(CURRENT_FILE_HANDLE.fileno())
+            except Exception:
+                pass
+
+        if CURRENT_LOGGER:
+            CURRENT_LOGGER.warning(
+                f"\n[NGẮT TIẾN TRÌNH] Nhận tín hiệu {sig_name} (tiến trình bị kill hoặc dừng). "
+                f"Đã lưu an toàn toàn bộ dữ liệu đã đào xuống đĩa! "
+                f"Khi khởi chạy lại, hệ thống sẽ tự động đào tiếp tục từ điểm này."
+            )
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _handler)
+    except Exception:
+        pass
+
+
+class DownloadCheckpoint:
+    """Quản lý tệp lưu trạng thái (.download_checkpoint.json) để ghi nhớ tiến độ đào dữ liệu."""
+    def __init__(self, output_dir: str):
+        self.checkpoint_path = os.path.join(output_dir, ".download_checkpoint.json")
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if os.path.exists(self.checkpoint_path):
+            try:
+                with open(self.checkpoint_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save(self, snr: str, status: str, details: Optional[dict] = None):
+        if snr not in self.data:
+            self.data[snr] = {}
+        self.data[snr].update({
+            "status": status,
+            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+            **(details or {})
+        })
+        try:
+            with open(self.checkpoint_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def get_status(self, snr: str) -> str:
+        return self.data.get(snr, {}).get("status", "pending")
+
 
 def format_size(bytes_num: int) -> str:
     """Chuyển đổi số bytes sang định dạng người đọc (KB, MB, GB)."""
@@ -97,9 +162,7 @@ def format_time(seconds: float) -> str:
 
 
 def compute_md5(file_path: str, chunk_size: int = 8 * 1024 * 1024, logger=None) -> str:
-    """
-    Tính mã băm MD5 của một tệp lớn bằng cách đọc từng khối để tránh tràn RAM.
-    """
+    """Tính mã băm MD5 của một tệp lớn bằng cách đọc từng khối để tránh tràn RAM."""
     if logger:
         logger.info(f"Đang kiểm tra tính toàn vẹn (MD5) của {os.path.basename(file_path)}...")
     hash_md5 = hashlib.md5()
@@ -124,6 +187,30 @@ def compute_md5(file_path: str, chunk_size: int = 8 * 1024 * 1024, logger=None) 
     return checksum
 
 
+def is_snr_already_extracted(output_dir: str, snr_key: str) -> Tuple[bool, int, str]:
+    """
+    Kiểm tra xem dữ liệu của tập SNR đã được giải nén sẵn sàng trên đĩa chưa.
+    Trả về: (đã_sẵn_sàng, số_lượng_file_wav, đường_dẫn_thư_mục)
+    """
+    possible_paths = [
+        os.path.join(output_dir, snr_key, "pump"),
+        os.path.join(output_dir, "pump", snr_key),
+        os.path.join(output_dir, snr_key),
+    ]
+    for p in possible_paths:
+        if os.path.isdir(p):
+            expected_ids = ["id_00", "id_02", "id_04", "id_06"]
+            found_ids = [m for m in expected_ids if os.path.isdir(os.path.join(p, m))]
+            if len(found_ids) >= 2:
+                wav_count = 0
+                for root, _, files in os.walk(p):
+                    wav_count += sum(1 for f in files if f.lower().endswith(".wav"))
+                # Một tập SNR của pump có > 4000 file wav. Nếu có trên 500 file thì coi như đã trích xuất
+                if wav_count >= 500:
+                    return True, wav_count, p
+    return False, 0, ""
+
+
 def download_file_with_resume(
     url_list: List[str],
     destination_path: str,
@@ -133,11 +220,14 @@ def download_file_with_resume(
     timeout: int = 60,
     max_retries: int = 5,
     logger=None,
+    checkpoint: Optional[DownloadCheckpoint] = None,
+    snr_key: str = "",
 ) -> bool:
     """
     Tải file từ danh sách URL với tính năng HTTP Range Resume.
-    Tự động tiếp tục từ vị trí đã tải nếu bị đứt mạng giữa chừng.
+    Tự động tiếp tục từ vị trí đã tải nếu bị kill hoặc ngắt mạng.
     """
+    global CURRENT_FILE_HANDLE
     dest_dir = os.path.dirname(destination_path)
     if dest_dir:
         os.makedirs(dest_dir, exist_ok=True)
@@ -150,18 +240,19 @@ def download_file_with_resume(
         current_size = os.path.getsize(destination_path)
         if expected_size and current_size == expected_size:
             if logger:
-                logger.info(f"File {filename} đã tồn tại đầy đủ ({format_size(current_size)}).")
+                logger.info(f"File {filename} đã tồn tại trọn vẹn ({format_size(current_size)}).")
             if expected_md5:
                 actual_md5 = compute_md5(destination_path, logger=logger)
                 if actual_md5.lower() == expected_md5.lower():
                     if logger:
-                        logger.info(f"Xác thực MD5 khớp chính xác! Bỏ qua tải.")
+                        logger.info(f"Xác thực MD5 khớp chính xác! Bỏ qua bước tải.")
+                    if checkpoint:
+                        checkpoint.save(snr_key, "downloaded", {"bytes": current_size})
                     return True
                 else:
                     if logger:
                         logger.warning(
-                            f"MD5 không khớp! Dự kiến: {expected_md5}, thực tế: {actual_md5}. "
-                            f"Sẽ tải lại file."
+                            f"MD5 không khớp! Dự kiến: {expected_md5}, thực tế: {actual_md5}. Tải lại file."
                         )
                     os.remove(destination_path)
             else:
@@ -170,7 +261,7 @@ def download_file_with_resume(
     # Thử lần lượt các URL mirror
     for url_idx, url in enumerate(url_list):
         if logger:
-            logger.info(f"Bắt đầu tải từ nguồn {url_idx + 1}/{len(url_list)}: {url}")
+            logger.info(f"Đang kết nối nguồn {url_idx + 1}/{len(url_list)}: {url}")
 
         retry_count = 0
         while retry_count < max_retries:
@@ -188,35 +279,41 @@ def download_file_with_resume(
                 headers = {"User-Agent": DEFAULT_USER_AGENT}
                 if existing_bytes > 0:
                     headers["Range"] = f"bytes={existing_bytes}-"
+                    pct = (existing_bytes / expected_size * 100) if expected_size else 0
                     if logger:
-                        logger.info(f"Tiếp tục tải (Resume) từ vị trí: {format_size(existing_bytes)}")
+                        logger.info(
+                            f"⚡ [RESUME] Phát hiện dữ liệu dở dang trước đó: {format_size(existing_bytes)} ({pct:.1f}%). "
+                            f"Đang tiếp tục tải từ byte {existing_bytes}..."
+                        )
 
                 session = requests.Session()
                 response = session.get(url, headers=headers, stream=True, timeout=timeout)
 
-                # Trường hợp resume thành công (206 Partial Content)
+                # 206: Hỗ trợ Resume tiếp tục nối file
                 if response.status_code == 206:
                     write_mode = "ab"
                     downloaded_so_far = existing_bytes
                     total_file_size = expected_size or (
                         int(response.headers.get("Content-Length", 0)) + existing_bytes
                     )
-                # Trường hợp tải mới hoặc server không hỗ trợ 206 (200 OK)
+                # 200: Server gửi toàn bộ file
                 elif response.status_code == 200:
                     write_mode = "wb"
                     downloaded_so_far = 0
                     total_file_size = int(response.headers.get("Content-Length", expected_size or 0))
-                # Trường hợp file đã tải trọn vẹn (416 Range Not Satisfiable)
+                    if existing_bytes > 0 and logger:
+                        logger.warning("Server không hỗ trợ Range 206, đang tải lại file từ đầu...")
+                # 416: File tạm đã tải đủ 100%
                 elif response.status_code == 416:
                     if logger:
-                        logger.info("Server báo Range Not Satisfiable (file đã hoàn thành).")
+                        logger.info("Server báo Range Not Satisfiable (file tạm đã hoàn thành 100%).")
                     if os.path.exists(temp_file):
                         shutil.move(temp_file, destination_path)
                         return True
                     break
-                elif response.status_code == 403:
+                elif response.status_code in [403, 429]:
                     if logger:
-                        logger.warning(f"Zenodo trả về mã lỗi 403 Forbidden đối với URL: {url}")
+                        logger.warning(f"Zenodo trả về mã lỗi {response.status_code}. Thử nguồn khác...")
                     break
                 else:
                     response.raise_for_status()
@@ -224,15 +321,17 @@ def download_file_with_resume(
                 is_tty = sys.stdout.isatty()
                 start_time = time.time()
                 last_log_time = start_time
+                last_flush_time = start_time
                 bytes_since_last_log = 0
 
                 if logger:
                     logger.info(
-                        f"Đang tải {filename} (Tổng: {format_size(total_file_size)}, "
-                        f"còn lại: {format_size(total_file_size - downloaded_so_far)})..."
+                        f"Bắt đầu tải {filename} (Tổng: {format_size(total_file_size)}, "
+                        f"cần tải tiếp: {format_size(total_file_size - downloaded_so_far)})..."
                     )
 
                 with open(temp_file, write_mode) as f:
+                    CURRENT_FILE_HANDLE = f
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if not chunk:
                             continue
@@ -242,8 +341,23 @@ def download_file_with_resume(
                         bytes_since_last_log += chunk_len
 
                         now = time.time()
-                        # Trong môi trường nohup (không có TTY), in định kỳ 10 giây một lần để log gọn gàng
-                        # Trong terminal tương tác (TTY), in tiến trình mỗi 1.5 giây
+
+                        # Ép flush và fsync mỗi 5 giây hoặc mỗi khi tải thêm 16MB
+                        # Đảm bảo nếu bị kill bất thình lình (kill -9) dữ liệu vẫn lưu trọn vẹn trên đĩa
+                        if now - last_flush_time >= 5.0 or bytes_since_last_log >= 16 * 1024 * 1024:
+                            f.flush()
+                            try:
+                                os.fsync(f.fileno())
+                            except Exception:
+                                pass
+                            last_flush_time = now
+                            if checkpoint:
+                                checkpoint.save(snr_key, "downloading", {
+                                    "downloaded_bytes": downloaded_so_far,
+                                    "total_bytes": total_file_size,
+                                })
+
+                        # Ghi log tiến trình
                         log_interval = 1.5 if is_tty else 10.0
                         if now - last_log_time >= log_interval:
                             duration = now - last_log_time
@@ -266,38 +380,44 @@ def download_file_with_resume(
                             last_log_time = now
                             bytes_since_last_log = 0
 
-                if is_tty:
-                    print()  # Xuống dòng sau khi hoàn tất
+                    CURRENT_FILE_HANDLE = None
 
-                # Đổi tên file tạm thành file chính thức sau khi tải xong
+                if is_tty:
+                    print()
+
+                # Đổi tên file tạm thành file chính thức sau khi tải hoàn tất
                 if os.path.exists(temp_file):
                     shutil.move(temp_file, destination_path)
                     if logger:
                         logger.info(f"Đã tải xong tệp: {filename} ({format_size(os.path.getsize(destination_path))})")
 
-                # Kiểm tra MD5
+                # Kiểm tra mã MD5
                 if expected_md5:
                     actual_md5 = compute_md5(destination_path, logger=logger)
                     if actual_md5.lower() == expected_md5.lower():
                         if logger:
                             logger.info(f"Xác thực MD5 thành công cho {filename}!")
+                        if checkpoint:
+                            checkpoint.save(snr_key, "downloaded", {"bytes": total_file_size})
                         return True
                     else:
                         if logger:
                             logger.error(
-                                f"LỖI: MD5 không khớp! Dự kiến: {expected_md5}, nhận được: {actual_md5}"
+                                f"LỖI: MD5 không khớp! Dự kiến: {expected_md5}, nhận được: {actual_md5}. Xóa tải lại..."
                             )
                         if os.path.exists(destination_path):
                             os.remove(destination_path)
                         retry_count += 1
                         continue
 
+                if checkpoint:
+                    checkpoint.save(snr_key, "downloaded", {"bytes": total_file_size})
                 return True
 
             except (requests.RequestException, IOError) as e:
                 retry_count += 1
                 if logger:
-                    logger.warning(f"Lỗi kết nối ({e}). Thử lại lần {retry_count}/{max_retries} sau 5 giây...")
+                    logger.warning(f"Lỗi mạng ({e}). Thử lại lần {retry_count}/{max_retries} sau 5 giây...")
                 time.sleep(5)
 
     if logger:
@@ -305,10 +425,17 @@ def download_file_with_resume(
     return False
 
 
-def extract_zip_file(zip_path: str, extract_to: str, delete_zip: bool = False, logger=None) -> bool:
+def extract_zip_file_with_resume(
+    zip_path: str,
+    extract_to: str,
+    delete_zip: bool = False,
+    logger=None,
+    checkpoint: Optional[DownloadCheckpoint] = None,
+    snr_key: str = "",
+) -> bool:
     """
-    Giải nén file zip chứa dữ liệu máy bơm vào thư mục đích.
-    Hiển thị tiến độ và số lượng tệp được giải nén.
+    Giải nén file zip với cơ chế resume:
+    Bỏ qua các file .wav đã được giải nén từ trước nếu bị kill giữa chừng.
     """
     if not os.path.exists(zip_path):
         if logger:
@@ -323,22 +450,43 @@ def extract_zip_file(zip_path: str, extract_to: str, delete_zip: bool = False, l
 
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
-            members = zf.namelist()
+            members = zf.infolist()
             total_members = len(members)
             if logger:
                 logger.info(f"Tổng số tệp âm thanh trong lưu trữ: {total_members}")
 
             last_log_time = time.time()
-            for idx, member in enumerate(members):
-                zf.extract(member, path=extract_to)
+            skipped_count = 0
+            extracted_count = 0
+
+            for idx, member_info in enumerate(members):
+                target_path = os.path.join(extract_to, member_info.filename)
+
+                # Kiểm tra nếu file đã được giải nén hoàn chỉnh từ phiên chạy trước
+                if os.path.exists(target_path):
+                    if member_info.is_dir() or os.path.getsize(target_path) == member_info.file_size:
+                        skipped_count += 1
+                        continue
+
+                zf.extract(member_info, path=extract_to)
+                extracted_count += 1
+
                 now = time.time()
                 if logger and (now - last_log_time > 15):
                     pct = (idx + 1) / total_members * 100
-                    logger.info(f"  [Giải nén {filename}] Đã giải nén {idx + 1}/{total_members} files ({pct:.1f}%)")
+                    logger.info(
+                        f"  [Giải nén {filename}] Tiến độ: {idx + 1}/{total_members} files ({pct:.1f}%) "
+                        f"[Mới: {extracted_count}, Đã có sẵn: {skipped_count}]"
+                    )
                     last_log_time = now
 
         if logger:
-            logger.info(f"Giải nén thành công {filename}!")
+            logger.info(
+                f"Giải nén thành công {filename}! (Giải nén mới: {extracted_count}, Bỏ qua file cũ: {skipped_count})"
+            )
+
+        if checkpoint:
+            checkpoint.save(snr_key, "completed", {"total_files": total_members})
 
         if delete_zip:
             if logger:
@@ -350,83 +498,6 @@ def extract_zip_file(zip_path: str, extract_to: str, delete_zip: bool = False, l
         if logger:
             logger.error(f"Lỗi trong quá trình giải nén {filename}: {e}")
         return False
-
-
-def download_mimii_pump(
-    output_dir: str = "./Data/raw",
-    snr_filter: str = "all",
-    extract: bool = False,
-    delete_zip: bool = False,
-    skip_checksum: bool = False,
-    logger=None,
-) -> bool:
-    """
-    Hàm tổng điều phối việc tải và chuẩn bị dữ liệu máy bơm từ MIMII Dataset.
-    """
-    if logger is None:
-        logger = setup_logger("MIMII_Pump_Downloader")
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    keys_to_download = []
-    if snr_filter.lower() == "all":
-        keys_to_download = list(MIMII_PUMP_METADATA.keys())
-    elif snr_filter in MIMII_PUMP_METADATA:
-        keys_to_download = [snr_filter]
-    else:
-        logger.error(f"Mức SNR không hợp lệ: '{snr_filter}'. Chọn một trong: all, -6_dB, 0_dB, 6_dB.")
-        return False
-
-    logger.info("=" * 70)
-    logger.info("   BẮT ĐẦU QUÁ TRÌNH TẢI BỘ DỮ LIỆU MÁY BƠM (MIMII PUMP DATASET)")
-    logger.info(f"   Thư mục lưu trữ  : {os.path.abspath(output_dir)}")
-    logger.info(f"   Các mức SNR chọn : {', '.join(keys_to_download)}")
-    logger.info(f"   Tự động giải nén : {'BẬT' if extract else 'TẮT'}")
-    logger.info(f"   Xóa file zip sau giải nén: {'BẬT' if delete_zip else 'TẮT'}")
-    logger.info("=" * 70)
-
-    success_all = True
-    for snr_key in keys_to_download:
-        meta = MIMII_PUMP_METADATA[snr_key]
-        dest_file = os.path.join(output_dir, meta["filename"])
-
-        logger.info(f"\n>>> [1/2] Xử lý tập {meta['filename']} ({snr_key}) - Dung lượng: {format_size(meta['size_bytes'])}")
-
-        expected_md5 = None if skip_checksum else meta["md5"]
-        download_ok = download_file_with_resume(
-            url_list=meta["urls"],
-            destination_path=dest_file,
-            expected_size=meta["size_bytes"],
-            expected_md5=expected_md5,
-            logger=logger,
-        )
-
-        if not download_ok:
-            logger.error(f"Thất bại khi tải {meta['filename']}!")
-            success_all = False
-            continue
-
-        if extract:
-            logger.info(f">>> [2/2] Bắt đầu giải nén {meta['filename']}...")
-            extract_dest = output_dir
-            extract_ok = extract_zip_file(
-                zip_path=dest_file,
-                extract_to=extract_dest,
-                delete_zip=delete_zip,
-                logger=logger,
-            )
-            if not extract_ok:
-                logger.error(f"Thất bại khi giải nén {meta['filename']}!")
-                success_all = False
-
-    logger.info("\n" + "=" * 70)
-    if success_all:
-        logger.info(" HOÀN TẤT: Toàn bộ dữ liệu máy bơm đã được chuẩn bị thành công!")
-    else:
-        logger.warning(" KẾT THÚC CÓ CẢNH BÁO: Một số tệp tải hoặc giải nén gặp sự cố.")
-    logger.info("=" * 70)
-
-    return success_all
 
 
 def get_default_data_dir() -> str:
@@ -444,6 +515,113 @@ def get_default_data_dir() -> str:
     if os.path.exists("/hdd3/users/dunglt") or os.path.exists("/hdd3"):
         return server_dir
     return "./data"
+
+
+def download_mimii_pump(
+    output_dir: str = "",
+    snr_filter: str = "all",
+    extract: bool = False,
+    delete_zip: bool = False,
+    skip_checksum: bool = False,
+    force: bool = False,
+    logger=None,
+) -> bool:
+    """
+    Hàm tổng điều phối việc tải và chuẩn bị dữ liệu máy bơm từ MIMII Dataset.
+    Tự động khôi phục và tiếp tục (Resume) khi bị ngắt.
+    """
+    global CURRENT_LOGGER
+    if not output_dir:
+        output_dir = get_default_data_dir()
+
+    if logger is None:
+        logger = setup_logger("MIMII_Pump_Downloader")
+    CURRENT_LOGGER = logger
+    register_signal_handler()
+
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint = DownloadCheckpoint(output_dir)
+
+    keys_to_download = []
+    if snr_filter.lower() == "all":
+        keys_to_download = list(MIMII_PUMP_METADATA.keys())
+    elif snr_filter in MIMII_PUMP_METADATA:
+        keys_to_download = [snr_filter]
+    else:
+        logger.error(f"Mức SNR không hợp lệ: '{snr_filter}'. Chọn một trong: all, -6_dB, 0_dB, 6_dB.")
+        return False
+
+    logger.info("=" * 75)
+    logger.info("   BẮT ĐẦU QUÁ TRÌNH TẢI DỮ LIỆU MÁY BƠM (MIMII PUMP DATASET)")
+    logger.info(f"   Thư mục lưu trữ  : {os.path.abspath(output_dir)}")
+    logger.info(f"   Các mức SNR chọn : {', '.join(keys_to_download)}")
+    logger.info(f"   Tự động giải nén : {'BẬT' if extract else 'TẮT'}")
+    logger.info(f"   Chế độ khôi phục : TỰ ĐỘNG RESUME (Chống mất dữ liệu khi bị kill)")
+    logger.info(f"   Bắt buộc tải lại : {'BẬT' if force else 'TẮT'}")
+    logger.info("=" * 75)
+
+    success_all = True
+    for snr_key in keys_to_download:
+        meta = MIMII_PUMP_METADATA[snr_key]
+        dest_file = os.path.join(output_dir, meta["filename"])
+
+        logger.info(f"\n---------------------------------------------------------------------------")
+        logger.info(f"KIỂM TRA TẬP: {meta['filename']} ({snr_key}) - Dung lượng gốc: {format_size(meta['size_bytes'])}")
+        logger.info(f"---------------------------------------------------------------------------")
+
+        # 1. Kiểm tra xem tập SNR này đã được giải nén sẵn sàng chưa (nếu không bật --force)
+        if not force and extract:
+            already_ready, wav_count, extracted_dir = is_snr_already_extracted(output_dir, snr_key)
+            if already_ready:
+                logger.info(
+                    f"⚡ [BỎ QUA - ĐÃ HOÀN TẤT] Phát hiện tập {snr_key} đã có đầy đủ {wav_count} file .wav "
+                    f"tại: {extracted_dir}."
+                )
+                logger.info(f"-> Không cần đào lại tập này, chuyển sang tập tiếp theo!")
+                checkpoint.save(snr_key, "completed", {"wav_count": wav_count})
+                continue
+
+        # 2. Tải file zip (tự động resume từ file .part nếu đang dở dang)
+        expected_md5 = None if skip_checksum else meta["md5"]
+        download_ok = download_file_with_resume(
+            url_list=meta["urls"],
+            destination_path=dest_file,
+            expected_size=meta["size_bytes"],
+            expected_md5=expected_md5,
+            logger=logger,
+            checkpoint=checkpoint,
+            snr_key=snr_key,
+        )
+
+        if not download_ok:
+            logger.error(f"Thất bại khi tải {meta['filename']}!")
+            success_all = False
+            continue
+
+        # 3. Giải nén (bỏ qua các file .wav đã được giải nén nếu trước đó bị kill giữa chừng)
+        if extract:
+            logger.info(f">>> Bắt đầu giải nén {meta['filename']}...")
+            extract_dest = output_dir
+            extract_ok = extract_zip_file_with_resume(
+                zip_path=dest_file,
+                extract_to=extract_dest,
+                delete_zip=delete_zip,
+                logger=logger,
+                checkpoint=checkpoint,
+                snr_key=snr_key,
+            )
+            if not extract_ok:
+                logger.error(f"Thất bại khi giải nén {meta['filename']}!")
+                success_all = False
+
+    logger.info("\n" + "=" * 75)
+    if success_all:
+        logger.info(" HOÀN TẤT: Toàn bộ dữ liệu máy bơm đã được chuẩn bị thành công!")
+    else:
+        logger.warning(" KẾT THÚC CÓ CẢNH BÁO: Một số tệp tải hoặc giải nén gặp sự cố.")
+    logger.info("=" * 75)
+
+    return success_all
 
 
 def parse_args():
@@ -480,6 +658,11 @@ def parse_args():
         help="Bỏ qua bước kiểm tra mã MD5 (không khuyến nghị).",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bắt buộc tải lại từ đầu, bỏ qua dữ liệu cũ.",
+    )
+    parser.add_argument(
         "--log_file",
         type=str,
         default="./logs/download_mimii.log",
@@ -497,6 +680,7 @@ def main():
         extract=args.extract,
         delete_zip=args.delete_zip,
         skip_checksum=args.skip_checksum,
+        force=args.force,
         logger=logger,
     )
 
