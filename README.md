@@ -84,17 +84,22 @@ git push -u origin main
 Đăng nhập SSH vào Server của bạn và thực hiện các bước sau:
 
 ```bash
-# 1. Clone dự án về Server
-git clone https://github.com/<tai-khoan-cua-ban>/<ten-repo>.git
-cd <ten-repo>
+# 1. Di chuyển vào thư mục làm việc của bạn
+cd /hdd3/users/dunglt
 
-# 2. Tạo môi trường ảo Python (khuyến nghị để tránh xung đột thư viện hệ thống)
-python3 -m venv venv
-source venv/bin/activate
+# 2. Clone dự án về Server
+git clone https://github.com/tyanzuq2811/edge_pump_asd.git
+cd edge_pump_asd
 
-# 3. Nâng cấp pip và cài đặt các thư viện cần thiết
-pip install --upgrade pip
-pip install -r requirements.txt
+# 3. Tạo môi trường Conda (chọn 1 trong 2 cách):
+# Cách A: 1 lệnh tạo môi trường và cài đặt trọn gói tất cả qua file environment.yml:
+conda env create -f environment.yml
+conda activate edge_pump
+
+# Cách B (tiêu chuẩn): Tạo môi trường rồi cài requirements.txt:
+# conda create -n edge_pump python=3.10 -y
+# conda activate edge_pump
+# pip install -r requirements.txt
 ```
 
 ---
