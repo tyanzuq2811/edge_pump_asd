@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Script tải dữ liệu MIMII Pump trực tiếp bằng curl
-# Tích hợp Auto-Retry Loop & Chống đứt kết nối (xử lý triệt để lỗi curl 18)
+# Đã xử lý tiền tố ./ cho file bắt đầu bằng dấu trừ (-6_dB_pump.zip)
 # ==============================================================================
 
 DATA_DIR="${1:-/hdd3/users/dunglt/edge_pump_asd/data}"
@@ -10,12 +10,11 @@ cd "$DATA_DIR"
 
 echo "=========================================================="
 echo "   TẢI DỮ LIỆU MÁY BƠM (MIMII PUMP) TRỰC TIẾP BẰNG CURL"
-echo "   (TỰ ĐỘNG NỐI FILE KHI ĐỨT KẾT NỐI - AUTO RETRY LOOP)"
 echo "=========================================================="
 echo "Thư mục lưu dữ liệu: $DATA_DIR"
 echo ""
 
-# Thông tin 3 file và dung lượng chuẩn chính xác (bytes) từ Zenodo 3384388
+# Danh sách 3 file (dùng tiền tố ./ để tránh Linux hiểu nhầm dấu '-' là cờ lệnh)
 FILES=("6_dB_pump.zip" "0_dB_pump.zip" "-6_dB_pump.zip")
 declare -A SIZES
 SIZES["6_dB_pump.zip"]=7659077508
@@ -37,15 +36,16 @@ format_bytes() {
 }
 
 get_file_size() {
-    local file=$1
+    local file="./$1"
     if [ -f "$file" ]; then
-        stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
+        stat -c%s -- "$file" 2>/dev/null || stat -f%z -- "$file" 2>/dev/null || wc -c < "$file" 2>/dev/null || echo 0
     else
         echo 0
     fi
 }
 
 for f in "${FILES[@]}"; do
+    FILE_PATH="./$f"
     EXPECTED_SIZE=${SIZES[$f]}
     URL="https://zenodo.org/records/3384388/files/${f}?download=1"
 
@@ -55,13 +55,13 @@ for f in "${FILES[@]}"; do
 
     CURRENT_SIZE=$(get_file_size "$f")
 
-    # VÒNG LẶP AUTO-RETRY: Tự động tải tiếp nếu mạng bị rớt (curl code 18)
+    # VÒNG LẶP AUTO-RETRY: Tự động tải tiếp nếu mạng bị rớt
     RETRY_COUNT=1
     while [ "$CURRENT_SIZE" -lt "$EXPECTED_SIZE" ]; do
         PCT=$(awk "BEGIN {printf \"%.1f\", ($CURRENT_SIZE/$EXPECTED_SIZE)*100}")
         echo ">> [Lần $RETRY_COUNT] Đang tải tiếp từ vị trí: $(format_bytes "$CURRENT_SIZE") / $(format_bytes "$EXPECTED_SIZE") ($PCT%)..."
 
-        # Chạy curl với resume (-C -)
+        # Chạy curl với resume (-C -) và file đích có tiền tố ./
         curl -C - -L \
             -A "$USER_AGENT" \
             -H "Referer: $REFERER" \
@@ -69,7 +69,7 @@ for f in "${FILES[@]}"; do
             -H "Accept-Language: en-US,en;q=0.9" \
             --connect-timeout 60 \
             "$URL" \
-            -o "$f" || true
+            -o "$FILE_PATH" || true
 
         NEW_SIZE=$(get_file_size "$f")
 
@@ -97,17 +97,18 @@ for f in "${FILES[@]}"; do
 
     # Chỉ giải nén khi file đã đủ 100% dung lượng
     FINAL_SIZE=$(get_file_size "$f")
-    if [ "$FINAL_SIZE" -ge "$EXPECTED_SIZE" ]; then
-        echo ""
-        echo ">> BẮT ĐẦU GIẢI NÉN $f (tự động bỏ qua file đã có)..."
-        if command -v unzip >/dev/null 2>&1; then
-            unzip -n -q "$f"
-        elif command -v 7z >/dev/null 2>&1; then
-            7z x -aos "$f"
-        else
-            python3 -c "import zipfile; zf=zipfile.ZipFile('$f'); zf.extractall('.')"
-        fi
-        echo ">> GIẢI NÉN HOÀN TẤT CHO $f!"
+    SNR_NAME="${f%_pump.zip}"
+    mkdir -p "./$SNR_NAME"
+    echo ""
+    echo ">> BẮT ĐẦU GIẢI NÉN $f vào thư mục ./$SNR_NAME (tự động bỏ qua file đã có)..."
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -n -q "$FILE_PATH" -d "./$SNR_NAME"
+    elif command -v 7z >/dev/null 2>&1; then
+        7z x -aos "$FILE_PATH" -o"./$SNR_NAME"
+    else
+        python3 -c "import zipfile; zf=zipfile.ZipFile('$FILE_PATH'); zf.extractall('./$SNR_NAME')"
+    fi
+    echo ">> GIẢI NÉN HOÀN TẤT CHO $f vào ./$SNR_NAME!"
         echo ""
     else
         echo "⚠️ CẢNH BÁO: Tệp $f chưa hoàn chỉnh ($(format_bytes "$FINAL_SIZE") / $(format_bytes "$EXPECTED_SIZE")). Chưa giải nén."
